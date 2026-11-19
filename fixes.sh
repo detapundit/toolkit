@@ -1,3 +1,16 @@
+if [ -r /sys/kernel/mm/transparent_hugepage/enabled ]; then
+  mode=$(cat /sys/kernel/mm/transparent_hugepage/enabled)
+  if printf '%s' "$mode" | grep -qE '\[[^]]+\]'; then
+    thp_clean=$(printf '%s' "$mode" | sed -E 's/.*\[([^]]+)\].*/\1/')
+  else
+    thp_clean="$mode"
+  fi
+  printf 'THP:%s\n' "$thp_clean"
+else
+  echo "THP:unreadable"
+fi
+
+
 check_backup_age() {
   case "$DEPLOYMENT" in
     atlas)
