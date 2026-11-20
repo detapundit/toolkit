@@ -98,6 +98,12 @@ PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
 PRECHECK_RESULTS_FILE=""
+NODE_STATS_FILE=""
+LAST_RS_NODES="[]"
+NODE_VERSION=""
+NODE_DBPATH=""
+OS_SKIPPED=0
+declare -A OS_CHECKED=()
 
 # --- Secret Redaction & Cleanup Trap -----------------------------------------
 redact_secrets() {
@@ -146,9 +152,11 @@ init_logging() {
   chmod 750 "${REPORT_DIR}"
   LOG_FILE="${REPORT_DIR}/session.log"
   PRECHECK_RESULTS_FILE="${SESSION_TMP_DIR}/prechecks.tsv"
+  NODE_STATS_FILE="${SESSION_TMP_DIR}/node_stats.jsonl"
   : > "${LOG_FILE}"
   : > "${PRECHECK_RESULTS_FILE}"
-  chmod 600 "${LOG_FILE}" "${PRECHECK_RESULTS_FILE}"
+  : > "${NODE_STATS_FILE}"
+  chmod 600 "${LOG_FILE}" "${PRECHECK_RESULTS_FILE}" "${NODE_STATS_FILE}"
 }
 
 log_msg() {
@@ -650,7 +658,7 @@ print(JSON.stringify(result));
 JS
 }
 
-# Replica-set state for ONE replica set (the node/URI you connect to must be a
+# Replica-set membership/state for ONE replica set (the node/URI you connect to must be a
 # member, or a replicaSet= seed URI). Every sub-query is isolated so a missing
 # privilege is reported, never silently turned into "healthy".
 js_rs_health() {
@@ -680,17 +688,12 @@ try {
     arbiterOnly: !!m.arbiterOnly
   }));
 } catch (e) { out.confError = msg(e); }
-try {
-  const ri = db.getReplicationInfo();
-  out.oplogWindowHours = num(ri.timeDiffHours);
-  if (out.oplogWindowHours === null) out.oplogError = "timeDiffHours missing";
-} catch (e) { out.oplogError = msg(e); }
 print(JSON.stringify(out));
 JS
 }
 
 # Node-local / mongos telemetry. Each section is independent and reports
-# ok | n/a | error:<reason>.
+# ok | n/a | error:<reason>. Run against ONE node (direct connection).
 js_telemetry() {
   cat <<'JS'
 // SNIPPET:telemetry
@@ -707,6 +710,24 @@ let ss = null, ssErr = "unknown";
 try { ss = db.adminCommand({ serverStatus: 1 }); } catch (e) { ssErr = msg(e); }
 const needSS = () => { if (!ss) throw new Error("serverStatus failed: " + ssErr); return ss; };
 const h = db.hello();
+const isMongos = (h.msg === "isdbgrid");
+
+sec("server", () => {
+  const s = needSS();
+  const bi = db.adminCommand({ buildInfo: 1 });
+  let dbPath = null;
+  try {
+    const o = db.adminCommand({ getCmdLineOpts: 1 });
+    dbPath = (((o.parsed || {}).storage || {}).dbPath) || null;
+  } catch (e) {}
+  let role = "OTHER";
+  if (isMongos) role = "MONGOS";
+  else if (h.isWritablePrimary && h.setName) role = "PRIMARY";
+  else if (h.isWritablePrimary) role = "STANDALONE";
+  else if (h.secondary) role = "SECONDARY";
+  else if (h.arbiterOnly) role = "ARBITER";
+  return { version: bi.version || null, uptimeSec: num(s.uptime), role: role, hidden: !!h.hidden, dbPath: dbPath, me: h.me || null };
+});
 
 sec("connections", () => {
   const c = needSS().connections || {};
@@ -719,17 +740,44 @@ sec("memory", () => {
   const s = needSS();
   const res = s.mem ? num(s.mem.resident) : null;
   const wt = s.wiredTiger && s.wiredTiger.cache;
-  let dirtyPct = null;
+  let dirtyPct = null, usedPct = null;
   if (wt) {
     const max = num(wt["maximum bytes configured"]);
     const dirty = num(wt["tracked dirty bytes in the cache"]);
+    const used = num(wt["bytes currently in the cache"]);
     if (max !== null && max > 0 && dirty !== null) dirtyPct = Number(((dirty / max) * 100).toFixed(2));
+    if (max !== null && max > 0 && used !== null) usedPct = Number(((used / max) * 100).toFixed(2));
   }
   if (res === null && dirtyPct === null) {
-    if (h.msg === "isdbgrid") return null;
+    if (isMongos) return null;
     throw new Error("no mem / wiredTiger cache statistics returned");
   }
-  return { residentMB: res, dirtyPct: dirtyPct };
+  return { residentMB: res, dirtyPct: dirtyPct, cacheUsedPct: usedPct };
+});
+
+sec("lock", () => {
+  const q = (needSS().globalLock || {}).currentQueue;
+  if (!q) throw new Error("globalLock.currentQueue missing");
+  return { queueTotal: num(q.total), readers: num(q.readers), writers: num(q.writers) };
+});
+
+sec("opcounters", () => {
+  const o = needSS().opcounters;
+  if (!o) throw new Error("opcounters missing");
+  return { insert: num(o.insert), query: num(o.query), update: num(o.update), delete: num(o.delete), getmore: num(o.getmore), command: num(o.command) };
+});
+
+sec("dataSize", () => {
+  const r = db.adminCommand({ listDatabases: 1 });
+  return { totalSizeBytes: num(r.totalSize), dbCount: (r.databases || []).length };
+});
+
+sec("oplog", () => {
+  if (isMongos || !h.setName) return null;
+  const ri = db.getReplicationInfo();
+  const w = num(ri.timeDiffHours);
+  if (w === null) throw new Error("timeDiffHours missing");
+  return { windowHours: w, usedMB: num(ri.usedMB), sizeMB: num(ri.logSizeMB) };
 });
 
 sec("longOps", () => {
@@ -742,7 +790,7 @@ sec("longOps", () => {
 });
 
 sec("sharded", () => {
-  if (h.msg !== "isdbgrid") return null;
+  if (!isMongos) return null;
   const r = {};
   r.shardCount = (db.adminCommand({ listShards: 1 }).shards || []).length;
   try { const b = db.adminCommand({ balancerStatus: 1 }); r.balancerMode = b.mode; r.inBalancerRound = !!b.inBalancerRound; }
@@ -1001,7 +1049,8 @@ jq_rs_summary_program() {
 | ($m | map(select(.stateStr == "PRIMARY"))) as $p
 | ($p[0].optimeMs // null) as $po
 | ($m | map(. as $x | . + {
-    lag: (if $x.stateStr == "SECONDARY" and $po != null and $x.optimeMs != null
+    lag: (if $x.stateStr == "PRIMARY" then 0
+          elif $x.stateStr == "SECONDARY" and $po != null and $x.optimeMs != null
           then ([0, (($po - $x.optimeMs) / 1000)] | max) else null end),
     cf: (if $c == null then null else ($c | map(select(.host == $x.name)) | .[0]) end),
     healthy: (($x.health == 1) and ($x.stateStr | IN("PRIMARY", "SECONDARY", "ARBITER")))
@@ -1022,8 +1071,7 @@ jq_rs_summary_program() {
                       and ((.cf.hidden // false) | not)
                       and ((.cf.arbiterOnly // false) | not)))) | .name],
     secondaries: [$mm[] | select(.stateStr == "SECONDARY") | .name],
-    oplogWindowHours: (.oplogWindowHours // null),
-    oplogError: (.oplogError // null),
+    nodes: [$mm[] | {name: .name, stateStr: .stateStr, healthy: .healthy, lagSec: .lag}],
     confError: (.confError // null)
   }
 JQ
@@ -1043,6 +1091,7 @@ check_rs_health() {
   local sfx=""
   if [[ -n "$label" ]]; then sfx=" [${label}]"; fi
 
+  LAST_RS_NODES="[]"
   local hj=""
   if ! hj="$(get_rs_health_json "$uri")" || [[ -z "$hj" ]]; then
     record_check "replica_set_state${sfx}" "FAIL" "Could not read replica set state - connection or privilege problem (${label:-target}): $(last_mongosh_error)"
@@ -1062,6 +1111,7 @@ check_rs_health() {
     return 0
   fi
 
+  LAST_RS_NODES="$(printf '%s' "$sum" | jq -c '.nodes')"
   local pc primary
   pc="$(printf '%s' "$sum" | jq -r '.primaryCount')"
   primary="$(printf '%s' "$sum" | jq -r '.primary')"
@@ -1120,18 +1170,6 @@ check_rs_health() {
     record_check "rs_config_visibility${sfx}" "WARN" "rs.conf() unavailable ($(printf '%s' "$sum" | jq -r '.confError // "unknown"')); voting/priority/hidden status was estimated"
   fi
 
-  local ow oerr
-  ow="$(printf '%s' "$sum" | jq -r '.oplogWindowHours // "null"')"
-  oerr="$(printf '%s' "$sum" | jq -r '.oplogError // empty')"
-  if [[ "$ow" == "null" ]]; then
-    record_check "oplog_window${sfx}" "WARN" "Oplog window unavailable: ${oerr:-no data}"
-  elif num_lt "$ow" 12; then
-    record_check "oplog_window${sfx}" "FAIL" "Oplog window is ${ow}h (< 12h)"
-  elif num_lt "$ow" 24; then
-    record_check "oplog_window${sfx}" "WARN" "Oplog window is ${ow}h (< 24h)"
-  else
-    record_check "oplog_window${sfx}" "PASS" "Oplog window is ${ow}h"
-  fi
   return 0
 }
 
@@ -1145,7 +1183,7 @@ rs_gate() {
   return 0
 }
 
-# --- Telemetry checks (connections, memory/cache, long ops, sharded) -----------
+# --- Node telemetry checks (connections, memory/cache, queue, oplog, long ops) ---
 sec_status() {
   printf '%s' "$1" | jq -r --arg n "$2" '.sections[$n] // "missing"'
 }
@@ -1161,17 +1199,79 @@ record_unavailable() {
   fi
 }
 
-run_telemetry_checks() {
-  local raw="" tel=""
-  if ! raw="$(run_mongosh_js "$(js_telemetry)")" || ! tel="$(extract_json "$raw")" || [[ -z "$tel" ]]; then
-    record_check "telemetry" "FAIL" "Could not collect server telemetry (connections, memory, operations): $(last_mongosh_error)"
+# Per-node stats row definition (shared by console table and reports)
+node_rows_jq() {
+  cat <<'JQ'
+def f(x): if x == null then "n/a" else (x | tostring) end;
+def up: if . == null then "n/a" else "\((. / 86400) | floor)d\(((. % 86400) / 3600) | floor)h" end;
+.[] | [
+  .node,
+  (f(.state) + (if .error then " (no direct conn)" else "" end)),
+  f(.version),
+  (.uptimeSec | up),
+  (if .connCur == null then "n/a" else "\(.connCur)/\(.connCur + .connAvail) (\(.connPct)%)" end),
+  f(.residentMB),
+  (if .cacheUsedPct == null then "n/a" else "\(.cacheUsedPct)/\(.dirtyPct // "n/a")" end),
+  f(.lagSec),
+  f(.oplogHours),
+  f(.dataSizeGB),
+  f(.queue),
+  f(.longOps)
+] | @tsv
+JQ
+}
+
+print_node_table() {
+  if [[ ! -s "$NODE_STATS_FILE" ]]; then
     return 0
   fi
+  {
+    printf '\n=== Per-node statistics ===\n'
+    printf '%-24s %-18s %-9s %-8s %-16s %-7s %-11s %-6s %-8s %-8s %-6s %-6s\n' \
+      Node State Version Uptime Connections RSS_MB 'Cache u/d%' Lag_s Oplog_h Data_GB Queue LongOps
+    local n st ver up conn rss cache lag oph dgb q lo
+    while IFS=$'\t' read -r n st ver up conn rss cache lag oph dgb q lo; do
+      printf '%-24s %-18s %-9s %-8s %-16s %-7s %-11s %-6s %-8s %-8s %-6s %-6s\n' \
+        "$n" "$st" "$ver" "$up" "$conn" "$rss" "$cache" "$lag" "$oph" "$dgb" "$q" "$lo"
+    done < <(jq -rs "$(node_rows_jq)" "$NODE_STATS_FILE")
+    printf '\n'
+  } | tee -a "${LOG_FILE:-/dev/null}" >&2
+}
+
+# Evaluate one node (or the mongos / standalone target) and record its stats.
+#   $1 uri   $2 check-name suffix   $3 host:port of a replica-set member (optional)
+#   $4 member state from rs.status (optional)   $5 lag seconds or "null"
+check_node() {
+  local uri="$1" sfx="$2" node="${3:-}" state="${4:-}" lag="${5:-null}"
+  local label="$node"
+  if [[ -z "$label" ]]; then
+    label="$(seed_hostports | head -n 1 || true)"
+    if [[ -z "$label" ]]; then label="target"; fi
+  fi
+  NODE_VERSION=""
+  NODE_DBPATH=""
+
+  local raw="" tel=""
+  if ! raw="$(run_mongosh_js "$(js_telemetry)" "$uri")" || ! tel="$(extract_json "$raw")" || [[ -z "$tel" ]]; then
+    if [[ -n "$node" ]]; then
+      local nstat="WARN"
+      if is_change_action "$ACTION"; then nstat="FAIL"; fi
+      record_check "node_stats${sfx}" "$nstat" "NOT VERIFIED: could not connect directly to ${node} from this host: $(last_mongosh_error)"
+      jq -cn --arg node "$label" --arg state "$state" --argjson lag "$lag" '{node:$node, state:$state, lagSec:$lag, error:true}' >> "$NODE_STATS_FILE"
+      check_os_node "$node" ""
+    else
+      record_check "telemetry${sfx}" "FAIL" "Could not collect server telemetry (connections, memory, operations): $(last_mongosh_error)"
+    fi
+    return 0
+  fi
+
+  NODE_VERSION="$(printf '%s' "$tel" | jq -r '.server.version // empty')"
+  NODE_DBPATH="$(printf '%s' "$tel" | jq -r '.server.dbPath // empty')"
 
   local s
   s="$(sec_status "$tel" connections)"
   if [[ "$s" != "ok" ]]; then
-    record_unavailable "connections" "$s"
+    record_unavailable "connections${sfx}" "$s"
   else
     local cur avail total pct=0
     cur="$(printf '%s' "$tel" | jq -r '.connections.current')"
@@ -1179,48 +1279,87 @@ run_telemetry_checks() {
     total=$(( cur + avail ))
     if (( total > 0 )); then pct=$(( cur * 100 / total )); fi
     if (( pct >= 85 )); then
-      record_check "connections" "FAIL" "Connections at ${pct}% (${cur} used, ${avail} available)"
+      record_check "connections${sfx}" "FAIL" "Connections at ${pct}% (${cur} used, ${avail} available)"
     elif (( pct >= 70 )); then
-      record_check "connections" "WARN" "Connections at ${pct}% (${cur} used, ${avail} available)"
+      record_check "connections${sfx}" "WARN" "Connections at ${pct}% (${cur} used, ${avail} available)"
     else
-      record_check "connections" "PASS" "Connections at ${pct}% (${cur} used, ${avail} available)"
+      record_check "connections${sfx}" "PASS" "Connections at ${pct}% (${cur} used, ${avail} available)"
     fi
   fi
 
   s="$(sec_status "$tel" memory)"
   if [[ "$s" != "ok" ]]; then
-    record_unavailable "memory_and_cache" "$s"
+    record_unavailable "memory_and_cache${sfx}" "$s"
   else
-    local rss dirty
+    local rss dirty used
     rss="$(printf '%s' "$tel" | jq -r '.memory.residentMB // "unknown"')"
     dirty="$(printf '%s' "$tel" | jq -r '.memory.dirtyPct // "n/a"')"
+    used="$(printf '%s' "$tel" | jq -r '.memory.cacheUsedPct // "n/a"')"
     if ! is_number "$dirty"; then
-      record_check "memory_and_cache" "WARN" "Resident=${rss}MB; WiredTiger dirty-cache % not available"
+      record_check "memory_and_cache${sfx}" "WARN" "Resident=${rss}MB; WiredTiger dirty-cache % not available"
     elif ! num_lt "$dirty" 20; then
-      record_check "memory_and_cache" "FAIL" "Resident=${rss}MB, WT dirty cache=${dirty}% of configured cache (>= 20%)"
+      record_check "memory_and_cache${sfx}" "FAIL" "Resident=${rss}MB, WT cache used=${used}%, dirty=${dirty}% of configured cache (>= 20%)"
     elif ! num_lt "$dirty" 10; then
-      record_check "memory_and_cache" "WARN" "Resident=${rss}MB, WT dirty cache=${dirty}% of configured cache (>= 10%)"
+      record_check "memory_and_cache${sfx}" "WARN" "Resident=${rss}MB, WT cache used=${used}%, dirty=${dirty}% of configured cache (>= 10%)"
     else
-      record_check "memory_and_cache" "PASS" "Resident=${rss}MB, WT dirty cache=${dirty}% of configured cache"
+      record_check "memory_and_cache${sfx}" "PASS" "Resident=${rss}MB, WT cache used=${used}%, dirty=${dirty}% of configured cache"
+    fi
+  fi
+
+  s="$(sec_status "$tel" lock)"
+  if [[ "$s" != "ok" ]]; then
+    record_unavailable "lock_queue${sfx}" "$s"
+  else
+    local qt qr qw
+    qt="$(printf '%s' "$tel" | jq -r '.lock.queueTotal // 0')"
+    qr="$(printf '%s' "$tel" | jq -r '.lock.readers // 0')"
+    qw="$(printf '%s' "$tel" | jq -r '.lock.writers // 0')"
+    if (( qt >= 10 )); then
+      record_check "lock_queue${sfx}" "WARN" "${qt} operations queued (readers=${qr}, writers=${qw})"
+    else
+      record_check "lock_queue${sfx}" "PASS" "${qt} operations queued (readers=${qr}, writers=${qw})"
     fi
   fi
 
   s="$(sec_status "$tel" longOps)"
   if [[ "$s" != "ok" ]]; then
-    record_unavailable "long_running_ops" "$s"
+    record_unavailable "long_running_ops${sfx}" "$s"
   else
     local lcount lmax
     lcount="$(printf '%s' "$tel" | jq -r '.longOps.count')"
     lmax="$(printf '%s' "$tel" | jq -r '.longOps.maxSecs')"
     if (( lcount >= 5 )); then
-      record_check "long_running_ops" "WARN" "${lcount} active operations >= 30s across all users (longest ${lmax}s)"
+      record_check "long_running_ops${sfx}" "WARN" "${lcount} active operations >= 30s across all users (longest ${lmax}s)"
     else
-      record_check "long_running_ops" "PASS" "${lcount} active operations >= 30s across all users (longest ${lmax}s)"
+      record_check "long_running_ops${sfx}" "PASS" "${lcount} active operations >= 30s across all users (longest ${lmax}s)"
+    fi
+  fi
+
+  # Oplog window is a property of EACH member's own oplog
+  if [[ -n "$node" ]]; then
+    s="$(sec_status "$tel" oplog)"
+    if [[ "$s" != "ok" ]]; then
+      record_unavailable "oplog_window${sfx}" "$s"
+    else
+      local ow used_pct
+      ow="$(printf '%s' "$tel" | jq -r '.oplog.windowHours')"
+      used_pct="$(printf '%s' "$tel" | jq -r 'if (.oplog.sizeMB // 0) > 0 and .oplog.usedMB != null then ((.oplog.usedMB * 100 / .oplog.sizeMB) | floor) else "unknown" end')"
+      if num_lt "$ow" 12; then
+        if [[ "$used_pct" =~ ^[0-9]+$ ]] && (( used_pct < 80 )); then
+          record_check "oplog_window${sfx}" "WARN" "Oplog spans ${ow}h but is only ${used_pct}% full, so this is a lower bound (oplog has not wrapped yet); re-check under steady-state load"
+        else
+          record_check "oplog_window${sfx}" "FAIL" "Oplog window is ${ow}h (< 12h; oplog ${used_pct}% full)"
+        fi
+      elif num_lt "$ow" 24; then
+        record_check "oplog_window${sfx}" "WARN" "Oplog window is ${ow}h (< 24h)"
+      else
+        record_check "oplog_window${sfx}" "PASS" "Oplog window is ${ow}h"
+      fi
     fi
   fi
 
   s="$(sec_status "$tel" sharded)"
-  if [[ "$DETECTED_TOPOLOGY" == "sharded" ]]; then
+  if [[ "$DETECTED_TOPOLOGY" == "sharded" && -z "$node" ]]; then
     if [[ "$s" != "ok" ]]; then
       record_unavailable "sharded_balancer_and_config" "$s"
     else
@@ -1243,8 +1382,81 @@ run_telemetry_checks() {
         record_check "sharded_balancer_and_config" "PASS" "${shard_cnt} shards, 0 jumbo chunks, balancer mode=${bmode}, inRound=${inround}"
       fi
     fi
-  else
+  elif [[ "$DETECTED_TOPOLOGY" != "sharded" && -z "$node" ]]; then
     record_check "sharded_balancer_and_config" "PASS" "Not a sharded cluster (topology=${DETECTED_TOPOLOGY})"
+  fi
+
+  # Stats row for the per-node table / report
+  jq -c --arg node "$label" --arg state "$state" --argjson lag "$lag" '{
+      node: $node,
+      state: (if $state != "" then $state else (.server.role // null) end),
+      lagSec: $lag,
+      version: (.server.version // null),
+      uptimeSec: (.server.uptimeSec // null),
+      connCur: (.connections.current // null),
+      connAvail: (.connections.available // null),
+      connPct: (if .connections and ((.connections.current + .connections.available) > 0)
+                then ((.connections.current * 100 / (.connections.current + .connections.available)) | floor) else null end),
+      residentMB: (.memory.residentMB // null),
+      cacheUsedPct: (.memory.cacheUsedPct // null),
+      dirtyPct: (.memory.dirtyPct // null),
+      oplogHours: (.oplog.windowHours // null),
+      dataSizeGB: (if .dataSize.totalSizeBytes != null then ((((.dataSize.totalSizeBytes / 1073741824) * 100) | round) / 100) else null end),
+      queue: (.lock.queueTotal // null),
+      longOps: (.longOps.count // null),
+      ops: (.opcounters // null)
+    }' <<<"$tel" >> "$NODE_STATS_FILE"
+
+  if [[ -n "$node" ]]; then
+    check_os_node "$node" "$NODE_DBPATH"
+  fi
+  return 0
+}
+
+# Connect DIRECTLY to every data-bearing member of the replica set last
+# evaluated by check_rs_health (LAST_RS_NODES) and collect per-node stats.
+check_rs_members() {
+  local label="${1:-}"
+  local base_sfx=""
+  if [[ -n "$label" ]]; then base_sfx="${label}/"; fi
+
+  local n_total
+  n_total="$(printf '%s' "$LAST_RS_NODES" | jq -r 'length')"
+  if (( n_total == 0 )); then
+    record_check "node_stats${label:+ [$label]}" "WARN" "NOT VERIFIED: member list unavailable, per-node statistics skipped"
+    return 0
+  fi
+
+  local -a versions=()
+  local name state healthy lag lag_json sfx
+  while IFS=$'\t' read -r name state healthy lag; do
+    if [[ -z "$name" ]]; then continue; fi
+    sfx=" [${base_sfx}${name}]"
+    if [[ "$state" == "ARBITER" ]]; then
+      record_check "node_stats${sfx}" "PASS" "Arbiter: holds no data or users; node-level statistics not applicable"
+      continue
+    fi
+    lag_json="null"
+    if is_number "$lag"; then lag_json="$lag"; fi
+    if [[ "$healthy" != "true" ]]; then
+      jq -cn --arg node "$name" --arg state "$state" --argjson lag "$lag_json" '{node:$node, state:$state, lagSec:$lag, error:true}' >> "$NODE_STATS_FILE"
+      record_check "node_stats${sfx}" "WARN" "Skipped: member reported ${state} by the replica set (see rs_member_health)"
+      continue
+    fi
+    check_node "$(build_member_uri "$name")" "$sfx" "$name" "$state" "$lag_json"
+    if [[ -n "$NODE_VERSION" ]]; then versions+=("$NODE_VERSION"); fi
+  done < <(printf '%s' "$LAST_RS_NODES" | jq -r '.[] | [.name, .stateStr, (.healthy | tostring), (.lagSec // "null" | tostring)] | @tsv')
+
+  local vsfx=""
+  if [[ -n "$label" ]]; then vsfx=" [${label}]"; fi
+  if (( ${#versions[@]} >= 2 )); then
+    local uniq
+    uniq="$(printf '%s\n' "${versions[@]}" | sort -u | paste -sd, -)"
+    if [[ "$uniq" == *,* ]]; then
+      record_check "rs_version_consistency${vsfx}" "WARN" "Members run different mongod versions: ${uniq} (expected only mid-upgrade)"
+    else
+      record_check "rs_version_consistency${vsfx}" "PASS" "All ${#versions[@]} members run ${uniq}"
+    fi
   fi
   return 0
 }
@@ -1417,16 +1629,32 @@ check_tls_certs() {
 remote_os_script() {
   cat <<'EOS'
 dbpath="$1"
+port="$2"
 if [ -n "$dbpath" ] && [ -d "$dbpath" ]; then target="$dbpath"; else target=/; fi
 df -P "$target" 2>/dev/null | awk 'NR==2 {print "DISK:" $5 "(" $4 "KB free on " $6 ")"}'
-pid=$(pidof mongod mongos 2>/dev/null | awk '{print $1}')
+pid=""
+if [ -n "$port" ] && command -v ss >/dev/null 2>&1; then
+  pid=$(ss -H -ltnp "sport = :$port" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+fi
+if [ -z "$pid" ] && [ -n "$port" ] && command -v pgrep >/dev/null 2>&1; then
+  pid=$(pgrep -f "mongo[ds].*--port[ =]${port}( |\$)" 2>/dev/null | head -n 1)
+fi
+src=process
+if [ -z "$pid" ]; then
+  n=$(pidof mongod mongos 2>/dev/null | wc -w)
+  if [ "$n" = 1 ]; then pid=$(pidof mongod mongos)
+  elif [ "$n" -gt 1 ]; then src=ambiguous
+  else src=session
+  fi
+fi
 if [ -n "$pid" ] && [ -r "/proc/$pid/limits" ]; then
   awk '/^Max open files/ {print "NOFILE:" $4} /^Max processes/ {print "NPROC:" $3}' "/proc/$pid/limits"
   echo "ULIMIT_SRC:process"
 else
   echo "NOFILE:$(ulimit -n 2>/dev/null)"
   echo "NPROC:$(ulimit -u 2>/dev/null)"
-  echo "ULIMIT_SRC:session"
+  if [ "$src" = process ]; then src=session; fi
+  echo "ULIMIT_SRC:$src"
 fi
 if [ -r /sys/kernel/mm/transparent_hugepage/enabled ]; then
   mode=$(cat /sys/kernel/mm/transparent_hugepage/enabled)
@@ -1463,20 +1691,23 @@ os_kv() {
 }
 
 check_os_host() {
-  local host="$1" dbp="$2" script="$3"
+  local host="$1" port="$2" dbp="$3" script="$4"
   local out=""
+  local hp="$host"
+  if [[ -n "$port" ]]; then hp="${host}:${port}"; else port=""; fi
+  if [[ -n "$port" && ! "$port" =~ ^[0-9]+$ ]]; then port=""; fi
   if is_local_host "$host"; then
-    out="$(bash -s -- "$dbp" <<<"$script" 2>/dev/null || true)"
+    out="$(bash -s -- "$dbp" "$port" <<<"$script" 2>/dev/null || true)"
   else
     local strict="yes"
     if [[ "$SSH_ACCEPT_NEW" == "true" ]]; then strict="accept-new"; fi
     local -a ssh_opts=(-o BatchMode=yes -o "ConnectTimeout=${SSH_TIMEOUT}" -o "StrictHostKeyChecking=${strict}")
     if [[ -n "$SSH_KEY" ]]; then ssh_opts+=(-i "$SSH_KEY"); fi
-    out="$(timeout "$((SSH_TIMEOUT + 20))s" ssh "${ssh_opts[@]}" "${SSH_USER}@${host}" "bash -s -- '${dbp}'" <<<"$script" 2>/dev/null || true)"
+    out="$(timeout "$((SSH_TIMEOUT + 20))s" ssh "${ssh_opts[@]}" "${SSH_USER}@${host}" "bash -s -- '${dbp}' '${port}'" <<<"$script" 2>/dev/null || true)"
   fi
 
   if [[ -z "$out" ]]; then
-    record_check "os_checks_ssh@${host}" "WARN" "NOT VERIFIED: OS check failed or timed out (SSH auth/host-key problem?)"
+    record_check "os_checks_ssh@${hp}" "WARN" "NOT VERIFIED: OS check failed or timed out (SSH auth/host-key problem?)"
     return 0
   fi
 
@@ -1491,21 +1722,23 @@ check_os_host() {
   local disk_pct="${disk_info%%%*}"
   if [[ "$disk_pct" =~ ^[0-9]+$ ]]; then
     if (( disk_pct >= 85 )); then
-      record_check "os_disk_space@${host}" "FAIL" "Disk usage ${disk_info}"
+      record_check "os_disk_space@${hp}" "FAIL" "Disk usage ${disk_info}"
     elif (( disk_pct >= 75 )); then
-      record_check "os_disk_space@${host}" "WARN" "Disk usage ${disk_info}"
+      record_check "os_disk_space@${hp}" "WARN" "Disk usage ${disk_info}"
     else
-      record_check "os_disk_space@${host}" "PASS" "Disk usage ${disk_info}"
+      record_check "os_disk_space@${hp}" "PASS" "Disk usage ${disk_info}"
     fi
   else
-    record_check "os_disk_space@${host}" "WARN" "NOT VERIFIED: could not read disk usage for the data path"
+    record_check "os_disk_space@${hp}" "WARN" "NOT VERIFIED: could not read disk usage for the data path"
   fi
 
   local lim_name val
   for lim_name in NOFILE NPROC; do
     if [[ "$lim_name" == "NOFILE" ]]; then val="$nofile"; else val="$nproc"; fi
-    local label="os_ulimit_${lim_name,,}@${host}"
-    if [[ "$src" != "process" ]]; then
+    local label="os_ulimit_${lim_name,,}@${hp}"
+    if [[ "$src" == "ambiguous" ]]; then
+      record_check "$label" "WARN" "NOT VERIFIED: several mongod processes on this host and the one on port ${port:-?} could not be identified (run as the mongod user or root)"
+    elif [[ "$src" != "process" ]]; then
       record_check "$label" "WARN" "NOT VERIFIED: no mongod/mongos process found on host; SSH-session value (${val:-unknown}) is not representative"
     elif [[ "$val" == "unlimited" ]]; then
       record_check "$label" "PASS" "${lim_name} limit of mongod is unlimited"
@@ -1522,50 +1755,57 @@ check_os_host() {
 
   local v_major="${DETECTED_VERSION%%.*}"
   if [[ "$thp" == "unreadable" || -z "$thp" ]]; then
-    record_check "os_thp@${host}" "WARN" "NOT VERIFIED: THP setting unreadable"
+    record_check "os_thp@${hp}" "WARN" "NOT VERIFIED: THP setting unreadable"
   elif [[ "$v_major" =~ ^[0-9]+$ ]] && (( v_major >= 8 )); then
-    record_check "os_thp@${host}" "WARN" "THP is '${thp}'. THP guidance differs for MongoDB 8.0+ - verify against the Production Notes for ${DETECTED_VERSION}"
+    record_check "os_thp@${hp}" "WARN" "THP is '${thp}'. THP guidance differs for MongoDB 8.0+ - verify against the Production Notes for ${DETECTED_VERSION}"
   elif [[ "$thp" == "never" ]]; then
-    record_check "os_thp@${host}" "PASS" "Transparent Huge Pages is 'never'"
+    record_check "os_thp@${hp}" "PASS" "Transparent Huge Pages is 'never'"
   else
-    record_check "os_thp@${host}" "WARN" "THP is '${thp}' (MongoDB < 8.0 recommends 'never')"
+    record_check "os_thp@${hp}" "WARN" "THP is '${thp}' (MongoDB < 8.0 recommends 'never')"
   fi
 
   case "$ntp" in
-    yes|Normal) record_check "os_ntp@${host}" "PASS" "Clock synchronised (${ntp})" ;;
-    no)         record_check "os_ntp@${host}" "WARN" "Clock reported NOT synchronised" ;;
-    *)          record_check "os_ntp@${host}" "WARN" "NOT VERIFIED: neither timedatectl nor chronyc gave a sync status" ;;
+    yes|Normal) record_check "os_ntp@${hp}" "PASS" "Clock synchronised (${ntp})" ;;
+    no)         record_check "os_ntp@${hp}" "WARN" "Clock reported NOT synchronised" ;;
+    *)          record_check "os_ntp@${hp}" "WARN" "NOT VERIFIED: neither timedatectl nor chronyc gave a sync status" ;;
   esac
   return 0
 }
 
+# OS checks for one host:port (once), using that node's own dbPath/port
+check_os_node() {
+  local hp="$1" dbp="$2" host port=""
+  if [[ "$DEPLOYMENT" == "atlas" ]]; then return 0; fi
+  if [[ -n "${OS_CHECKED[$hp]:-}" ]]; then return 0; fi
+  OS_CHECKED["$hp"]=1
+  if [[ "$hp" == *:* ]]; then host="${hp%:*}"; port="${hp##*:}"; else host="$hp"; fi
+  if [[ ! "$dbp" =~ ^/[A-Za-z0-9._/-]*$ ]]; then dbp=""; fi
+  if is_local_host "$host" || [[ -n "$SSH_USER" ]]; then
+    check_os_host "$host" "$port" "$dbp" "$(remote_os_script)"
+  else
+    OS_SKIPPED=$((OS_SKIPPED + 1))
+  fi
+  return 0
+}
+
+# Hosts not already covered by the per-node pass (standalone, mongos, config servers)
 check_os_hosts() {
   if [[ "$DEPLOYMENT" == "atlas" ]]; then
     record_check "os_checks_ssh" "PASS" "N/A: Atlas manages OS, THP and ulimits"
     return 0
   fi
 
-  local dbp="$DETECTED_DBPATH"
-  if [[ ! "$dbp" =~ ^/[A-Za-z0-9._/-]*$ ]]; then dbp=""; fi
-  local script
-  script="$(remote_os_script)"
-
-  local hp host seen=0 skipped=0
+  local hp seen=0
   while IFS= read -r hp; do
     if [[ -z "$hp" ]]; then continue; fi
-    host="${hp%:*}"
     seen=$((seen + 1))
-    if is_local_host "$host" || [[ -n "$SSH_USER" ]]; then
-      check_os_host "$host" "$dbp" "$script"
-    else
-      skipped=$((skipped + 1))
-    fi
+    check_os_node "$hp" "$DETECTED_DBPATH"
   done < <(collect_target_hostports)
 
-  if (( seen == 0 )); then
+  if (( seen == 0 && ${#OS_CHECKED[@]} == 0 )); then
     record_check "os_checks_ssh" "WARN" "NOT VERIFIED: no member hosts known"
-  elif (( skipped > 0 )); then
-    record_check "os_checks_ssh" "WARN" "NOT VERIFIED: SSH not configured (--ssh-user omitted); OS checks skipped for ${skipped} host(s)"
+  elif (( OS_SKIPPED > 0 )); then
+    record_check "os_checks_ssh" "WARN" "NOT VERIFIED: SSH not configured (--ssh-user omitted); OS checks skipped for ${OS_SKIPPED} node(s)"
   fi
   return 0
 }
@@ -1576,6 +1816,9 @@ run_prechecks() {
   WARN_COUNT=0
   FAIL_COUNT=0
   : > "${PRECHECK_RESULTS_FILE}"
+  : > "${NODE_STATS_FILE}"
+  OS_CHECKED=()
+  OS_SKIPPED=0
 
   log_info "=== Running Pre-Checks (deployment=${DEPLOYMENT}, topology=${DETECTED_TOPOLOGY}, edition=${DETECTED_EDITION}) ==="
 
@@ -1593,22 +1836,24 @@ run_prechecks() {
     record_check "version_and_fcv" "WARN" "Could not determine version (${DETECTED_VERSION}) or FCV (${DETECTED_FCV})"
   fi
 
-  run_telemetry_checks
-
   case "$DETECTED_TOPOLOGY" in
     standalone)
+      check_node "$(build_mongosh_uri)" ""
       record_check "replica_set_state" "PASS" "Standalone node: no replication to verify"
       ;;
     replicaset)
       check_rs_health "$(build_mongosh_uri)" ""
+      check_rs_members ""
       ;;
     sharded)
+      check_node "$(build_mongosh_uri)" ""
       local n_shards=0 sid shost
       while IFS=$'\t' read -r sid shost; do
         if [[ -z "$sid" ]]; then continue; fi
         if [[ -n "$SHARD_ID" && "$sid" != "$SHARD_ID" ]]; then continue; fi
         n_shards=$((n_shards + 1))
         check_rs_health "$(build_shard_uri "$shost")" "shard:${sid}"
+        check_rs_members "shard:${sid}"
       done < <(printf '%s' "$DETECTED_SHARDS_JSON" | jq -r '.[]? | "\(._id)\t\(.host)"')
       if (( n_shards == 0 )); then
         record_check "replica_set_state" "FAIL" "No shard replica sets could be selected for checking"
@@ -1622,6 +1867,7 @@ run_prechecks() {
   check_backup_age
   check_tls_certs
   check_os_hosts
+  print_node_table
 
   log_info "=== Pre-Check Summary: PASS=${PASS_COUNT}, WARN=${WARN_COUNT}, FAIL=${FAIL_COUNT} ==="
   if (( FAIL_COUNT > 0 )); then
@@ -2045,6 +2291,17 @@ action_report() {
       printf '*Topology:* %s | *Edition:* %s | *Version:* %s | *FCV:* %s  \n' \
         "$DETECTED_TOPOLOGY" "$DETECTED_EDITION" "$DETECTED_VERSION" "$DETECTED_FCV"
       printf '*Overall:* **%s** (PASS=%d, WARN=%d, FAIL=%d)\n\n' "$overall" "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+      if [[ -s "$NODE_STATS_FILE" ]]; then
+        printf '## Per-node statistics\n\n'
+        printf '| Node | State | Version | Uptime | Connections | RSS MB | Cache used/dirty %% | Lag s | Oplog h | Data GB | Queue | Long ops |\n'
+        printf '|---|---|---|---|---|---|---|---|---|---|---|---|\n'
+        local n st ver up conn rss cache lag oph dgb q lo
+        while IFS=$'\t' read -r n st ver up conn rss cache lag oph dgb q lo; do
+          printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+            "$(md_escape "$n")" "$(md_escape "$st")" "$(md_escape "$ver")" "$up" "$conn" "$rss" "$cache" "$lag" "$oph" "$dgb" "$q" "$lo"
+        done < <(jq -rs "$(node_rows_jq)" "$NODE_STATS_FILE")
+        printf '\n## Checks\n\n'
+      fi
       printf '| Check | Status | Detail |\n|---|---|---|\n'
       local cname cstatus cdetail
       while IFS=$'\t' read -r cname cstatus cdetail; do
@@ -2068,6 +2325,19 @@ action_report() {
       printf 'Topology: %s | Edition: %s | Version: %s | FCV: %s<br>' \
         "$(html_escape "$DETECTED_TOPOLOGY")" "$(html_escape "$DETECTED_EDITION")" "$(html_escape "$DETECTED_VERSION")" "$(html_escape "$DETECTED_FCV")"
       printf 'Overall: <span class="%s">%s</span> (PASS=%d, WARN=%d, FAIL=%d)</p>' "$overall" "$overall" "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+      if [[ -s "$NODE_STATS_FILE" ]]; then
+        printf '<h2>Per-node statistics</h2><table><tr><th>Node</th><th>State</th><th>Version</th><th>Uptime</th><th>Connections</th><th>RSS MB</th><th>Cache used/dirty %%</th><th>Lag s</th><th>Oplog h</th><th>Data GB</th><th>Queue</th><th>Long ops</th></tr>'
+        local n st ver up conn rss cache lag oph dgb q lo
+        while IFS=$'\t' read -r n st ver up conn rss cache lag oph dgb q lo; do
+          printf '<tr>'
+          local cell
+          for cell in "$n" "$st" "$ver" "$up" "$conn" "$rss" "$cache" "$lag" "$oph" "$dgb" "$q" "$lo"; do
+            printf '<td>%s</td>' "$(html_escape "$cell")"
+          done
+          printf '</tr>'
+        done < <(jq -rs "$(node_rows_jq)" "$NODE_STATS_FILE")
+        printf '</table><h2>Checks</h2>'
+      fi
       printf '<table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>'
       local cname cstatus cdetail
       while IFS=$'\t' read -r cname cstatus cdetail; do
